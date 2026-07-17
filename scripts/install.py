@@ -1290,10 +1290,42 @@ class Installer:
             subprocess.run(
                 ["hermes", "plugins", "enable", "miloco"],
                 capture_output=True, text=True, check=True,
+                stdin=subprocess.DEVNULL,
             )
         except subprocess.CalledProcessError:
             self.ui.warn(self.ui.i18n.t("plugin.hermes_enable_failed"))
+
+        self._hermes_run_post_install(hermes_home, extract_dir)
         self.ui.step_ok(self.ui.i18n.t("plugin.hermes_ok"))
+
+    def _hermes_run_post_install(self, hermes_home: Path, extract_dir: Path) -> None:
+        """调 plugins/hermes/install-hermes.sh --post-install 补齐 env 持久化 / cron / 收尾提示。
+
+        install.py step 8 已做的 plugin 分发 / adapter 部署 / config.json patch / .env 写入 /
+        hermes plugins enable 在 --post-install 模式里全部跳过；本调用只负责：
+          - shell rc / supervisord.conf 里 MILOCO_HOME 持久化 (step 1.9)
+          - hermes disabled 残留清理 (step 8.5)
+          - 版本记录到 state.json (step 9)
+          - cron reconcile (step 10)
+          - 收尾 banner「hermes gateway restart」提示
+
+        install-hermes.sh 在 hermes-plugin tarball 里由 build.sh::build_hermes 打包，
+        跟 miloco-plugin 平级。找不到就 warn 跳过（不阻塞主流程）。
+        """
+        script = extract_dir / "install-hermes.sh"
+        if not script.is_file():
+            self.ui.warn(self.ui.i18n.t("plugin.hermes_post_install_missing"))
+            return
+        env = os.environ.copy()
+        env["MILOCO_HOME"] = str(self.miloco_home)
+        env["HERMES_HOME"] = str(hermes_home)
+        try:
+            subprocess.run(
+                ["bash", str(script), "--post-install"],
+                check=True, env=env, stdin=subprocess.DEVNULL,
+            )
+        except subprocess.CalledProcessError as exc:
+            self.ui.warn(self.ui.i18n.t("plugin.hermes_post_install_failed", exc.returncode))
 
     def _hermes_deploy_plugin(self, hermes_home: Path, extract_dir: Path) -> None:
         plugin_dir = hermes_home / "plugins" / "miloco" / "miloco-plugin"
@@ -1739,17 +1771,54 @@ def _print_error_summary(ui: UI, _args: argparse.Namespace) -> None:
     ui.console.print()
 
 
+def _decide_agent_platform(
+    args: argparse.Namespace, plat: "Platform", ui: "UI"
+) -> str:
+    """决定 agent_platform：--agent-platform > 非交互 fallback openclaw > 交互 prompt。
+
+    非交互路径（agent-prepare/agent-finish/uninstall/no tty）不弹 prompt，直接 fallback。
+    """
+    if args.agent_platform:
+        return args.agent_platform
+    if (
+        args.agent_prepare
+        or args.agent_finish
+        or args.uninstall
+        or not plat.is_interactive
+    ):
+        return "openclaw"
+    openclaw_label = ui.i18n.t("platform.openclaw_option")
+    hermes_label = ui.i18n.t("platform.hermes_option")
+    choice = ui.prompt_select(
+        ui.i18n.t("platform.ask"),
+        choices=[openclaw_label, hermes_label],
+        default=openclaw_label,
+    )
+    return "hermes" if choice == hermes_label else "openclaw"
+
+
+def _default_miloco_home(agent_platform: str) -> Path:
+    """按 agent runtime 决定 MILOCO_HOME 默认路径。
+
+    - hermes  → ~/.hermes/miloco
+    - openclaw → ~/.openclaw/miloco
+    """
+    subdir = ".hermes" if agent_platform == "hermes" else ".openclaw"
+    return Path.home() / subdir / "miloco"
+
+
 def main() -> None:
     args = parse_args()
-
-    miloco_home = Path(
-        os.environ.get("MILOCO_HOME", Path.home() / ".openclaw" / "miloco")
-    )
-    miloco_home.mkdir(parents=True, exist_ok=True)
 
     plat = Platform.detect(lang_override=args.lang)
     i18n = I18n(plat.lang, Path(__file__).parent)
     ui = UI(i18n)
+
+    agent_platform = _decide_agent_platform(args, plat, ui)
+    miloco_home = Path(
+        os.environ.get("MILOCO_HOME") or _default_miloco_home(agent_platform)
+    )
+    miloco_home.mkdir(parents=True, exist_ok=True)
 
     # Agent mode: --agent-prepare or --agent-finish implies non-interactive agent flow
     if args.agent_prepare or args.agent_finish:
@@ -1763,7 +1832,7 @@ def main() -> None:
             account_auth=args.account_auth,
             miloco_home=miloco_home,
             skip_openclaw=args.skip_openclaw,
-            agent_platform=args.agent_platform,
+            agent_platform=agent_platform,
         )
         atexit.register(installer._stop_service)
         atexit.register(installer._cleanup_install_cache)
@@ -1812,7 +1881,7 @@ def main() -> None:
         account_auth=args.account_auth,
         miloco_home=miloco_home,
         skip_openclaw=args.skip_openclaw,
-        agent_platform=args.agent_platform,
+        agent_platform=agent_platform,
     )
 
     atexit.register(installer._stop_service)

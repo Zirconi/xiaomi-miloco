@@ -21,9 +21,10 @@ set -euo pipefail
 # 强制 UTF-8 + POSIX 字符类，防止 "$VAR中文" 被 bash 误识别为变量名延续
 export LANG=C.UTF-8 LC_ALL=C.UTF-8
 
-# --- CLI 参数解析（--diagnose / --no-start-backend / -h） ---
+# --- CLI 参数解析（--diagnose / --no-start-backend / --post-install / -h） ---
 DIAGNOSE_ONLY=0
 NO_START_BACKEND=0
+POST_INSTALL_ONLY=0
 
 # 日志函数必须先定义（CLI 参数解析里会用到 warn）
 G='\033[0;32m'; Y='\033[1;33m'; R='\033[0;31m'; N='\033[0m'
@@ -35,25 +36,28 @@ for arg in "$@"; do
   case "$arg" in
     --diagnose) DIAGNOSE_ONLY=1 ;;
     --no-start-backend) NO_START_BACKEND=1 ;;
+    --post-install) POST_INSTALL_ONLY=1 ;;
     --help|-h)
       cat <<EOF
 用法：bash install-hermes.sh [options]
   （无参数）       完整安装（patch config / 写 .env / 复制 plugin / 启 backend / enable plugin）
   --diagnose         自检模式：跑 14 项检查输出 ✓/✗，不做任何修改
   --no-start-backend 跳过自动 miloco-cli service start（upstream install 退出时 atexit 杀掉的）
+  --post-install     被 install.py step 8 调用；跳过 install.py 已做的 step (2/3/4/5/6/7/8)，
+                     只跑 env 持久化 (1.7/1.75/1.9) + disable 残留清理 (8.5) + 版本记录 (9) + cron (10)
   -h, --help         显示本帮助
 EOF
       exit 0
       ;;
     *)
-      warn "未知参数: $arg（可用: --diagnose, --no-start-backend, -h）"
+      warn "未知参数: $arg（可用: --diagnose, --no-start-backend, --post-install, -h）"
       ;;
   esac
 done
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
-MILOCO_HOME="${MILOCO_HOME:-$HOME/.openclaw/miloco}"
+MILOCO_HOME="${MILOCO_HOME:-$HOME/.hermes/miloco}"
 HERMES_PLUGINS_DIR="$HERMES_HOME/plugins/miloco"
 
 # 从 config.json 动态读取 backend 端口（不写死 1810）
@@ -339,7 +343,8 @@ fi
 # 1.5 自动拉起 miloco backend（upstream install.py 注册了 atexit._stop_service，
 # 装完会停 backend；fork 集成必须自己再 service start，否则 Step 2 OAuth 会 502 假错误）
 # 用 --no-start-backend flag 可跳过（用户在外部管理 backend 时）
-if [ "$NO_START_BACKEND" -eq 0 ]; then
+# --post-install 场景下 install.py 会自己启 backend，也跳过
+if [ "$NO_START_BACKEND" -eq 0 ] && [ "$POST_INSTALL_ONLY" -eq 0 ]; then
   # 注意：miloco-cli service status 输出 JSON 形如 {"running": true/false,...}。
   # 老版本用 grep -qiE "running|active|ok|started" 会把 {"running": false} 也当成"在跑"，
   # 假阳性导致本该 start 的 backend 没起，Step 2 OAuth 必 502。改成 jq 解析 running 字段。
@@ -382,7 +387,8 @@ fi
 # 现象：supervisord 进程在跑但 supervisord.conf 已被删（半装态）。
 # 后果：miloco service status 永远说"在跑"，但实际接不上 / 行为异常。
 # 修法：检测到这种状态就 warn + 提示用户怎么清理，**不**擅自 kill supervisord（它可能管着别的服务）。
-if [ -d "$MILOCO_HOME" ]; then
+# --post-install 场景下 install.py 主流程刚装完，无残留可能，跳过。
+if [ "$POST_INSTALL_ONLY" -eq 0 ] && [ -d "$MILOCO_HOME" ]; then
 SUPERVISORD_CONF="$MILOCO_HOME/supervisord.conf"
   SUPERVISORD_PID="$MILOCO_HOME/supervisord.pid"
   SUPERVISORD_SOCK="$MILOCO_HOME/supervisord.sock"
@@ -406,24 +412,6 @@ SUPERVISORD_CONF="$MILOCO_HOME/supervisord.conf"
   if [ ! -f "$MILOCO_HOME/config.json" ]; then
     warn "半装残留：config.json 缺失（upstream --agent-prepare 似乎没成功）"
     warn "  修复：curl -LsSf https://github.com/XiaoMi/xiaomi-miloco/releases/latest/download/install.sh | bash -s -- --agent-prepare"
-  fi
-fi
-
-# --- 1.7 MILOCO_HOME 持久化（写进 shell rc，下次新 shell 不用再 export） ---
-# 用户的 shell rc 文件（macOS = ~/.zshrc，Linux = ~/.bashrc，WSL Git Bash = ~/.bashrc）
-SHELL_RC=""
-case "${SHELL:-}" in
-  */zsh)  SHELL_RC="$HOME/.zshrc" ;;
-  */bash) SHELL_RC="$HOME/.bashrc" ;;
-  *)      SHELL_RC="$HOME/.bashrc" ;;  # 兜底 bash
-esac
-if [ -n "$MILOCO_HOME" ] && [ "$MILOCO_HOME" != "$HOME/.openclaw/miloco" ]; then
-  # 用户用了非默认路径，持久化
-  if [ -n "$SHELL_RC" ] && [ -f "$SHELL_RC" ] && ! grep -q "export MILOCO_HOME=" "$SHELL_RC" 2>/dev/null; then
-    echo "" >> "$SHELL_RC"
-    echo "# miloco Hermes 兼容层" >> "$SHELL_RC"
-    echo "export MILOCO_HOME=\"$MILOCO_HOME\"" >> "$SHELL_RC"
-    info "MILOCO_HOME 已持久化到 $SHELL_RC"
   fi
 fi
 
@@ -513,36 +501,22 @@ fi
 
 mark_done 1
 
-# --- 1.9 【hermes-pr.md §五 #10 MILOCO_HOME 显式配置】 ---
-# doc 要求 plugin / backend / CLI 三进程解析到同一个 MILOCO_HOME。
-# 默认 ~/.openclaw/miloco,本步切到 ~/.hermes/miloco(用户态根目录,跨 host 迁移更顺)。
-#
-# 实现策略:
-# 1. 创建 symlink ~/.hermes/miloco → ~/.openclaw/miloco(避免数据迁移)
-# 2. 写 export MILOCO_HOME=~/.hermes/miloco 到 ~/.zshrc + ~/.bashrc(用户 shell rc)
-#    —— 关键:miloco-cli service start 每次都重新生成 supervisord.conf(用
-#    miloco_home() 的当前值,直接读环境),所以 supervisor conf 写什么不重要,
-#    重要的是 supervisor 进程(macOS 是 launchd 启动的 shell)能拿到 MILOCO_HOME env。
-# 3. 改 supervisord.conf 的 environment(防御性,launchd 父进程若不传 env 时兜底)
-# 4. supervisorctl reread + update(下次 backend 重启继承)
-step 1.9 "MILOCO_HOME 显式配置 ${HERMES_HOME}/miloco"
-MILOCO_HOME_HERMES="${HERMES_HOME}/miloco"
-if [ ! -e "$MILOCO_HOME_HERMES" ] && [ -d "$MILOCO_HOME" ]; then
-  info "  创建 symlink: $MILOCO_HOME_HERMES -> $MILOCO_HOME (避免数据迁移)"
-  ln -s "$MILOCO_HOME" "$MILOCO_HOME_HERMES"
-elif [ -d "$MILOCO_HOME_HERMES" ] && [ ! -L "$MILOCO_HOME_HERMES" ]; then
-  warn "  $MILOCO_HOME_HERMES 已是真实目录(非 symlink),不强行覆盖"
-fi
-# 写用户 shell rc(关键路径:macOS supervisor 由 launchd 启动,env 来自 launchd
-# → 父进程 shell → shell rc。如果 shell rc 设了 MILOCO_HOME,supervisor 子进程
-# 继承,生成的 supervisord.conf::environment=MILOCO_HOME 才会用对的值)
+# --- 1.9 MILOCO_HOME env 持久化 ---
+# doc 要求 plugin / backend / CLI 三进程解析到同一个 MILOCO_HOME。方案 B 下 miloco
+# 数据直接装在 $MILOCO_HOME (默认 ~/.hermes/miloco)，非 fallback 默认值 ~/.openclaw/miloco。
+# 三处必须写：
+#   1. shell rc (~/.zshrc / ~/.bashrc) —— 新开 shell 里 miloco-cli / hermes 都能读到
+#   2. supervisord.conf::environment —— supervisord 拉起 backend 时的 env 兜底
+#   3. supervisorctl reread + update —— 下次 backend 重启继承
+step 1.9 "MILOCO_HOME env 持久化 (shell rc + supervisord.conf)"
+# 写用户 shell rc
 SHELL_RC_LIST=()
 [ -f "$HOME/.zshrc" ] && SHELL_RC_LIST+=("$HOME/.zshrc")
 [ -f "$HOME/.bashrc" ] && SHELL_RC_LIST+=("$HOME/.bashrc")
 if [ ${#SHELL_RC_LIST[@]} -gt 0 ]; then
   for _rc in "${SHELL_RC_LIST[@]}"; do
     if grep -q "^export MILOCO_HOME=" "$_rc" 2>/dev/null; then
-      "$PYTHON" - "$_rc" "$MILOCO_HOME_HERMES" <<'PY'
+      "$PYTHON" - "$_rc" "$MILOCO_HOME" <<'PY'
 import re, sys
 rc, new = sys.argv[1], sys.argv[2]
 text = open(rc, encoding='utf-8').read()
@@ -552,27 +526,27 @@ PY
       info "  $_rc: export MILOCO_HOME 已更新"
     else
       echo "" >> "$_rc"
-      echo "# miloco Hermes 兼容层(MILOCO_HOME=${MILOCO_HOME_HERMES:-默认 ~/.openclaw/miloco})" >> "$_rc"
-      echo "export MILOCO_HOME=\"$MILOCO_HOME_HERMES\"" >> "$_rc"
+      echo "# miloco (Hermes runtime)" >> "$_rc"
+      echo "export MILOCO_HOME=\"$MILOCO_HOME\"" >> "$_rc"
       info "  $_rc: export MILOCO_HOME 已追加"
     fi
   done
 else
   warn "  ~/.zshrc / ~/.bashrc 都不存在,无法持久化 MILOCO_HOME"
-  warn "  手动在 shell rc 加: export MILOCO_HOME=\"$MILOCO_HOME_HERMES\""
+  warn "  手动在 shell rc 加: export MILOCO_HOME=\"$MILOCO_HOME\""
 fi
-# 改 supervisor conf 把 MILOCO_HOME env 切到 ~/.hermes/miloco
-# (注意 miloco-cli service start 每次会重新生成,这里写只是防御,真生效靠 shell rc)
+# 改 supervisor conf 把 MILOCO_HOME env 写死
+# (miloco-cli service start 每次重新生成 supervisord.conf,这里写只是防御,真生效靠 shell rc)
 SUPERVISORD_CONF="$MILOCO_HOME/supervisord.conf"
 if [ -f "$SUPERVISORD_CONF" ]; then
   if grep -q 'MILOCO_HOME=' "$SUPERVISORD_CONF"; then
-    "$PYTHON" - "$SUPERVISORD_CONF" "$MILOCO_HOME_HERMES" <<'PY'
+    "$PYTHON" - "$SUPERVISORD_CONF" "$MILOCO_HOME" <<'PY'
 import re, sys
 path, new_home = sys.argv[1], sys.argv[2]
 text = open(path, encoding='utf-8').read()
 text = re.sub(r'MILOCO_HOME="[^"]*"', f'MILOCO_HOME="{new_home}"', text)
 open(path, 'w', encoding='utf-8').write(text)
-print(f"  supervisord.conf::MILOCO_HOME = {new_home} (防御性,被 miloco-cli start 覆盖时由 shell rc 兜底)")
+print(f"  supervisord.conf::MILOCO_HOME = {new_home}")
 PY
   fi
 fi
@@ -582,6 +556,12 @@ if command -v supervisorctl >/dev/null 2>&1 && [ -S "$MILOCO_HOME/supervisor.soc
   supervisorctl -c "$SUPERVISORD_CONF" update 2>&1 | head -3 || true
 fi
 mark_done 1.9
+
+# --- 2 ~ 8: 主体部署 ---
+# --post-install 场景下这段全部跳过（install.py step 8 已经做完了 plugin 分发 / adapter 部署 /
+# config.json patch / .env 写入 / hermes plugins enable，本脚本作为后置补齐只跑 env 持久化 +
+# 8.5 disable 残留清理 + 9 版本记录 + 10 cron reconcile + 收尾 banner）。
+if [ "$POST_INSTALL_ONLY" -eq 0 ]; then
 
 # --- 2. 拿/复用 Bearer ---
 step 2 "拿/复用 adapter Bearer"
@@ -849,6 +829,8 @@ else
   warn "找不到 hermes CLI，跳过 enable（装完手动跑 hermes plugins enable miloco）"
 fi
 mark_done 8
+
+fi  # POST_INSTALL_ONLY guard 结束（对应 step 2 之前的 `if [ "$POST_INSTALL_ONLY" -eq 0 ]; then`）
 
 # --- 8.5 兜底清掉 hermes namespace disable 漏写 ---
 # upstream hermes plugins enable 用 manifest.name="miloco" discard disabled 集合，

@@ -211,6 +211,8 @@ build_hermes() {
             cp -r "$skill_dir" "$stage/miloco-plugin-skills/$name"
         fi
     done
+    # install.py step 8 会调 install-hermes.sh --post-install 补齐 env 持久化 / cron reconcile
+    cp "$hermes_dir/install-hermes.sh" "$stage/install-hermes.sh"
 
     local tar_name="miloco-hermes-plugin-${RESOLVED_PEP}.tar.gz"
     tar -czf "$DIST_DIR/$tar_name" -C "$stage" .
