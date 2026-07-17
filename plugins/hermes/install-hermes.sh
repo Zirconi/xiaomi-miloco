@@ -561,6 +561,11 @@ if command -v supervisorctl >/dev/null 2>&1 && [ -S "$MILOCO_HOME/supervisor.soc
 fi
 mark_done 1.9
 
+# 建 ~/.hermes/memory/（感知/巡检 skill 首轮 read_file / search_files 的目标目录）。
+# 无它 skill 报 "Path not found: memory"，LLM 会误判 workspace 异常。
+# 提到大 guard 外，让 --post-install 也建。
+mkdir -p "$HERMES_HOME/memory"
+
 # --- 2 ~ 8: 主体部署 ---
 # --post-install 场景下这段全部跳过（install.py step 8 已经做完了 plugin 分发 / adapter 部署 /
 # config.json patch / .env 写入 / hermes plugins enable，本脚本作为后置补齐只跑 env 持久化 +
@@ -647,12 +652,7 @@ if [ ! -f "$STATIC_DST/index.html" ] && [ -f "$WEB_DIR/package.json" ]; then
   fi
 fi
 
-# 建 ~/.hermes/memory/(感知 cron skill 写感知摘要的目标目录)。首次跑 cron 时
-# skill 会 `ls /Users/wkea/memory/<date>-miloco-perception.md`,目录不存在会报
-# "No such file or directory"。这里是 cron 链路真 bug —— skill 写文件前必须
-# 保证父目录存在。
-mkdir -p "$HERMES_HOME/memory"
-
+# memory 目录 mkdir 已提到大 guard 外（--post-install 也要建），这里不重复
 mark_done 4
 
 
