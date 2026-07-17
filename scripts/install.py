@@ -579,29 +579,16 @@ class Installer:
         if self.dev:
             self._run_dev_build()
         self._service_started = False
-        # hermes 场景不装机中启 backend：
-        # - service:  hermes plugin register() 里 daemon thread 自动 miloco-cli service start
-        # - account/model: 装完 hermes gateway restart 后交给 agent 跟用户交互完成
-        #   (详见 scripts/install-guide-hermes.md Step 2)
-        # openclaw 场景保持原样（openclaw 需要装机中完成 onboarding）。
-        common_head = [
+        self._steps: list[tuple[str, Callable[[], None]]] = [
             ("platform", self._step_choose_platform),
             ("env", self._step_check_deps),
             ("install", self._step_install),
-        ]
-        backend_and_onboarding = [
             ("service", self._step_init_service),
             ("account", self._step_account),
             ("model", self._step_configure),
-        ]
-        common_tail = [
             ("download", self._step_download),
             ("plugin", self._step_plugin),
         ]
-        if self.agent_platform == "hermes":
-            self._steps: list[tuple[str, Callable[[], None]]] = common_head + common_tail
-        else:
-            self._steps = common_head + backend_and_onboarding + common_tail
         self._total_steps = len(self._steps)
         for i, (_, fn) in enumerate(self._steps, 1):
             self._current_step = i
