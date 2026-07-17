@@ -1325,7 +1325,7 @@ class Installer:
                 check=True, env=env, stdin=subprocess.DEVNULL,
             )
         except subprocess.CalledProcessError as exc:
-            self.ui.warn(self.ui.i18n.t("plugin.hermes_post_install_failed", exc.returncode))
+            self.ui.warn(self.ui.i18n.t("plugin.hermes_post_install_failed", str(exc.returncode)))
 
     def _hermes_deploy_plugin(self, hermes_home: Path, extract_dir: Path) -> None:
         plugin_dir = hermes_home / "plugins" / "miloco" / "miloco-plugin"
@@ -1819,6 +1819,9 @@ def main() -> None:
         os.environ.get("MILOCO_HOME") or _default_miloco_home(agent_platform)
     )
     miloco_home.mkdir(parents=True, exist_ok=True)
+    # 关键：导出到 environ，让所有子进程 (miloco-cli / supervisord / backend / 打包 wheel 起的
+    # miloco.main) 继承正确的 MILOCO_HOME，否则 backend fallback 到 ~/.openclaw/miloco。
+    os.environ["MILOCO_HOME"] = str(miloco_home)
 
     # Agent mode: --agent-prepare or --agent-finish implies non-interactive agent flow
     if args.agent_prepare or args.agent_finish:
