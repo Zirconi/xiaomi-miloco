@@ -59,6 +59,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 MILOCO_HOME="${MILOCO_HOME:-$HOME/.hermes/miloco}"
 HERMES_PLUGINS_DIR="$HERMES_HOME/plugins/miloco"
+# step 9 (版本记录) 用 —— 顶部初始化避免 --post-install 跳过 step 4 后 unbound var
+PLUGIN_STATE="$HERMES_PLUGINS_DIR/miloco-plugin/state.json"
 
 # 从 config.json 动态读取 backend 端口（不写死 1810）
 _read_backend_port() {
@@ -651,7 +653,6 @@ mkdir -p "$HERMES_HOME/memory"
 
 mark_done 4
 
-PLUGIN_STATE="$HERMES_PLUGINS_DIR/miloco-plugin/state.json"
 
 # --- 4.7 同步本地感知 ONNX 模型到 MILOCO_HOME/models/ ---
 # [PR合并后] 可简化：上游 --agent-finish 自动下载模型，不再需要从 fork 仓库 cp
