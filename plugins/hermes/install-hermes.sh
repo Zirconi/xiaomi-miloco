@@ -61,6 +61,8 @@ MILOCO_HOME="${MILOCO_HOME:-$HOME/.hermes/miloco}"
 HERMES_PLUGINS_DIR="$HERMES_HOME/plugins/miloco"
 # step 9 (版本记录) 用 —— 顶部初始化避免 --post-install 跳过 step 4 后 unbound var
 PLUGIN_STATE="$HERMES_PLUGINS_DIR/miloco-plugin/state.json"
+# 收尾 banner 用 —— 顶部初始化避免 --post-install 跳过 step 5 后 unbound var
+TS="$(date +%Y%m%d-%H%M%S)-pid$$-nsec$(date +%N)"
 
 # 从 config.json 动态读取 backend 端口（不写死 1810）
 _read_backend_port() {
@@ -723,7 +725,7 @@ BACKEND_PORT=$(_read_backend_port)
 WEBHOOK_URL="http://127.0.0.1:${BACKEND_PORT}/miloco/webhook"
 
 # 备份一次(防御:miloco-cli config set 若实现改了 schema,rollback 用)
-TS="$(date +%Y%m%d-%H%M%S)-pid$$-nsec$(date +%N)"
+# TS 已在顶部初始化
 if [ -f "$MILOCO_HOME/config.json" ]; then
   cp "$MILOCO_HOME/config.json" "${MILOCO_HOME}/config.json.bak-${TS}"
   # 清理老备份:保留最新 3 份
