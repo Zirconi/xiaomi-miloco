@@ -10,6 +10,7 @@ import json
 import logging
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 
 from miot.types import (
     MIoTActionParam,
@@ -65,6 +66,9 @@ from miloco.miot.schema import (
 )
 
 logger = logging.getLogger(__name__)
+
+# 容器里这一笔的来源标记。切换清空与对齐、推送分开记，dump 里一眼能看出是谁动的
+SCOPE_SWITCH_SOURCE = "scope_switch"
 
 # 持有后台 task 引用，避免 CPython GC 回收 fire-and-forget task。
 _background_tasks: set[asyncio.Task] = set()
@@ -229,6 +233,10 @@ class MiotService:
         self._notify_deduper = MessageDeduper(
             window_sec=get_settings().notify.dedup_window_sec
         )
+        # 切换编排的串行锁。都在一个 event loop 上只保证没有数据竞争，不保证不交错 ——
+        # 编排里每个 await 都是让出点，两次切换并发进来时，旧的那次完全可能在新的那次
+        # 写完之后才执行它那一步清空，把新作用域的树抹掉
+        self._scope_switch_lock = asyncio.Lock()
 
     async def lru_snapshot(self) -> dict:
         return self._lru.load()
@@ -276,6 +284,91 @@ class MiotService:
         except Exception as e:
             logger.warning("LRU touch failed for did=%s iids=%s: %s", did, iids, e)
 
+    async def _cancel_running_alignment(self) -> None:
+        """取消上一轮状态对齐，并等它真的停下来。
+
+        只 cancel 不等的话，它可能在容器清空之后才写完最后一笔。作用域代号那道闸能
+        兜住这种情况，但两道一起才不依赖单点。
+        """
+        from miloco.manager import get_manager
+
+        task = get_manager().state_align_task
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            # 这个 CancelledError 是上一行 cancel() 自己引发的，不是外面在取消我们
+            pass
+        except Exception as e:
+            logger.warning("上一轮状态对齐是带着异常结束的: %s", e)
+
+    async def _reset_state_scope(
+        self,
+        rebuild: Callable[[], Awaitable[None]] | None = None,
+        *,
+        realign: bool = True,
+    ) -> None:
+        """切换账号或家庭时重建状态容器。切换入口统一走这里。
+
+        `rebuild` 是各入口自己的中段：建立启用集、刷新设备 / 相机 / 场景。它跑在锁内
+        且必须排在对齐之前 —— 对齐读的是设备缓存，缓存还没换就对齐，等于把旧家庭的
+        设备写进新作用域。
+
+        `realign=False` 给解绑用：解绑之后没有账号，起新对齐只会拿不到设备、白打一轮
+        日志。属性订阅那道门因为「这一代没对齐过」天然关着，不需要额外挡。
+
+        锁只包这个方法，不包整个入口方法：asyncio.Lock 不可重入，而入口方法之间存在
+        调用关系。锁一拿住，本轮代号在编排跑完之前不会变，所以编排内部不再逐步校验。
+        """
+        from miloco.manager import get_manager
+
+        manager = get_manager()
+        async with self._scope_switch_lock:
+            manager.begin_scope_switch()
+            await self._cancel_running_alignment()
+            manager.state_store.clear(source=SCOPE_SWITCH_SOURCE)
+            if rebuild is not None:
+                await rebuild()
+            if realign:
+                manager.start_state_alignment()
+
+    async def _refresh_all_caches(self) -> None:
+        """把设备 / 相机 / 场景缓存换成新作用域的。单个失败不拖垮另外两个。"""
+        results = await asyncio.gather(
+            self._miot_proxy.refresh_devices(),
+            self._miot_proxy.refresh_cameras(),
+            self._miot_proxy.refresh_scenes(),
+            return_exceptions=True,
+        )
+        errors = [r for r in results if isinstance(r, Exception)]
+        if errors:
+            logger.warning("作用域切换时刷新缓存部分失败: %s", errors)
+        try:
+            await self._sync_camera_adapter()
+        except Exception as e:
+            logger.warning("作用域切换时同步相机 adapter 失败: %s", e)
+
+    def _schedule_scope_reset(
+        self, rebuild: Callable[[], Awaitable[None]] | None = None
+    ) -> None:
+        """把编排丢到后台。给 HTTP 入口用 —— 刷新和对齐都要打云端，等不起。
+
+        串行仍由编排自己的锁保证，丢后台不会让两次切换交错。
+        """
+
+        async def _run() -> None:
+            try:
+                await self._reset_state_scope(rebuild)
+            except Exception as e:
+                logger.warning("作用域切换编排失败: %s", e, exc_info=True)
+
+        task = asyncio.create_task(_run())
+        # 防御性持有引用，避免 task 在 await 挂起期间被 GC 回收。
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+
     def _clear_account_scope_state(self) -> None:
         """Clear service-layer scope residue (called on account switch)."""
         self._kv_repo.delete(ScopeConfigKeys.HOME_WHITE_LIST_KEY)
@@ -297,19 +390,20 @@ class MiotService:
         try:
             logger.info("authorize_with_code state=%s code=%s…", state, code[:8])
 
-            self._clear_account_scope_state()
-            await self._miot_proxy.get_miot_auth_info(code=code, state=state)
+            async def _rebuild() -> None:
+                self._clear_account_scope_state()
+                await self._miot_proxy.get_miot_auth_info(code=code, state=state)
+                # 建立启用集必须排在刷新和对齐之前：上一行把启用集删了，而
+                # is_home_allowed 对空启用集一律返回假 —— 这时候刷新，所有摄像头
+                # 被跳过、managers 建不出来；这时候对齐，空作用域会按「零可读属性
+                # 算成功」被标成已对齐，属性订阅的门就开在一个空作用域上。
+                # 走 _ensure_home_selected 而不是 list_homes：后者会再触发一轮编排，
+                # 而我们此刻正拿着编排锁，asyncio.Lock 不可重入
+                await self._ensure_home_selected()
+                # get_miot_auth_info 内部那次刷新跑在启用集还空着的时候，这里重来一遍
+                await self._refresh_all_caches()
 
-            # 登录后 list_homes 兜底会自动选第一个家庭（如果启用集为空）。
-            await self.list_homes()
-            # list_homes 已确保 HOME_WHITE_LIST_KEY 非空（空集时自动选首个家庭）；
-            # get_miot_auth_info 内部的初次 refresh_cameras 在白名单还是空集时运行，
-            # is_home_allowed 对空集返回 False → 所有摄像头被 continue 跳过 →
-            # _camera_img_managers 为空。这里补一次确保 managers 正确创建。
-            await self._miot_proxy.refresh_cameras()
-            # _sync_camera_adapter 的结果会被下面 restart 里的 sync_all_devices 覆盖,
-            # 保留是为了在 perception engine 未运行时也能让感知订阅状态收敛。
-            await self._sync_camera_adapter()
+            await self._reset_state_scope(_rebuild)
 
             # Restart perception engine so camera adapters can re-register
             # frame callbacks now that camera_img_managers exist.
@@ -500,14 +594,19 @@ class MiotService:
         Unbind MIoT: fully clean up MIoT state and reinitialize to a clean state.
         """
         try:
-            self._clear_account_scope_state()
-            await self._miot_proxy.deinit()
-            # deinit 已清空 _camera_info_dict 和 token；init 重建 client 但无
-            # 有效 token，refresh_cameras 大概率静默失败（返回 None）。
-            # 仍调用一次：若 token 残留则清掉旧摄像机 managers；失败无副作用。
-            await self._miot_proxy.init()
-            await self._miot_proxy.refresh_cameras()
-            await self._sync_camera_adapter()
+
+            async def _rebuild() -> None:
+                self._clear_account_scope_state()
+                await self._miot_proxy.deinit()
+                # deinit 已清空 _camera_info_dict 和 token；init 重建 client 但无
+                # 有效 token，refresh_cameras 大概率静默失败（返回 None）。
+                # 仍调用一次：若 token 残留则清掉旧摄像机 managers；失败无副作用。
+                await self._miot_proxy.init()
+                await self._miot_proxy.refresh_cameras()
+                await self._sync_camera_adapter()
+
+            # 解绑之后没有账号，不起新对齐：只会拿不到设备、白打一轮日志
+            await self._reset_state_scope(_rebuild, realign=False)
         except Exception as e:
             logger.error("Failed to unbind MIoT: %s", e)
             raise MiotServiceException(f"Failed to unbind MIoT: {str(e)}") from e
@@ -1032,6 +1131,22 @@ class MiotService:
     async def list_homes(self) -> list[dict]:
         """列出账号下全部家庭（绕过过滤），每项含 in_use 标记。
 
+        启用集是被这一趟改过的话，顺带重置会话 —— 自动选家和用户显式切家一样换掉了
+        当前家庭，旧家庭的上下文不清会串进新家庭。
+        """
+        homes, changed = await self._ensure_home_selected()
+        if changed:
+            self._schedule_agent_session_reset()
+            self._schedule_scope_reset(self._refresh_all_caches)
+        return homes
+
+    async def _ensure_home_selected(self) -> tuple[list[dict], bool]:
+        """拉家庭全集，并保证启用集里至少有一个还看得见的家庭。
+
+        返回 `(家庭列表, 启用集有没有被这一趟改过)`。**副作用只有写 KV** —— 要不要
+        因此重置会话、清容器，是调用方按自己的场景决定的，不在这里做：`switch_home`
+        紧接着就要把启用集改成用户点的那个家，在这里先编排一轮等于白清一次。
+
         优先调米家 SDK ``get_homes_async()`` 拿用户真全集（含没设备 / 设备全离线
         的家），失败兜底到从 cached devices/cameras 反推。Union devices 与 cameras
         两个 dict 的 home_id —— 「家里只装了一台摄像头、无其他设备」这种单看
@@ -1041,6 +1156,7 @@ class MiotService:
         """
         allow = allowed_home_ids(self._kv_repo)
         seen: dict[str, dict] = {}
+        changed = False
 
         # 主路径：米家 user-level API 拿全集
         try:
@@ -1096,13 +1212,11 @@ class MiotService:
             logger.info("启用集与可见家庭无交集，自动启用首个家庭 %s（兜底）", first)
             for h in seen.values():
                 h["in_use"] = h["home_id"] in allow
-            # 兜底自动切换同样换掉了启用家庭 → 重置会话，消除旧家庭上下文泄漏
-            # （与显式 switch_home 同一 bug class）。
-            self._schedule_agent_session_reset()
+            changed = True
 
         # 按 home_id 字典序排序——米家 SDK 返回顺序受设备活跃度等影响不稳定，
         # 不排 HomeSwitcher 列表会在两次 reload 之间跳。
-        return sorted(seen.values(), key=lambda h: h["home_id"])
+        return sorted(seen.values(), key=lambda h: h["home_id"]), changed
 
     def _schedule_agent_session_reset(self) -> None:
         """切换家庭后后台 best-effort 重置 openclaw 里的 miloco session，清掉旧家庭
@@ -1132,43 +1246,26 @@ class MiotService:
         返回切换后的全量家庭列表。刷新设备/摄像头/场景放到后台异步完成，
         避免让 HTTP 响应等待云端 API 调用。
         """
-        homes = await self.list_homes()
+        # 启用集在校验之前先读：_ensure_home_selected 可能顺手自动选了首个家庭，
+        # 读晚了就把那次自动选当成"切换前的状态"，用户点的那次反而看着没变化
+        prev_allow = allowed_home_ids(self._kv_repo)
+        # 走 _ensure_home_selected 而不是 list_homes：后者会为自动选家先重置一次会话，
+        # 而这里紧接着就要切到用户点的那个家，白重置一次
+        homes, _ = await self._ensure_home_selected()
         known = {h["home_id"] for h in homes}
         if home_id not in known:
             raise ValidationException(
                 f"Unknown home_id {home_id!r}; valid: {sorted(known)}"
             )
-        # 切换前后的启用集：只有真的变了才 reset——切到"已是当前唯一启用"的家庭
-        # （重复点选 / 重复提交同一 home_id）不该白删仍然有效的热上下文。
-        prev_allow = allowed_home_ids(self._kv_repo)
         # 先把目标加进在用集合,再把其余移出。
         target_list, _ = set_homes_in_use(self._kv_repo, [home_id], True)
         others = [h for h in target_list if h != home_id]
         if others:
             target_list, _ = set_homes_in_use(self._kv_repo, others, False)
 
-        # 后台异步刷新：设备/摄像头/场景列表需随家庭切换更新，但不必
-        # 让 HTTP 响应等它们完成。设备列表/摄像头列表请求时兜底触发刷新。
-        async def _background_refresh():
-            results = await asyncio.gather(
-                self._miot_proxy.refresh_devices(),
-                self._miot_proxy.refresh_cameras(),
-                self._miot_proxy.refresh_scenes(),
-                return_exceptions=True,
-            )
-            errors = [r for r in results if isinstance(r, Exception)]
-            if errors:
-                logger.warning("switch_home background refresh partial failure: %s",
-                               errors)
-            try:
-                await self._sync_camera_adapter()
-            except Exception as e:
-                logger.warning("switch_home _sync_camera_adapter failed: %s", e)
-
-        task = asyncio.create_task(_background_refresh())
-        # 防御性持有引用，避免 task 在 await 挂起期间被 GC 回收。
-        _background_tasks.add(task)
-        task.add_done_callback(_background_tasks.discard)
+        # 整段编排放后台：刷新和对齐都要打云端，让 HTTP 响应等它们会卡住几秒。
+        # 设备列表/摄像头列表请求时兜底触发刷新。
+        self._schedule_scope_reset(self._refresh_all_caches)
 
         # KV 已写入，本地更新 in_use 标记后立即返回，不等待 refresh 完成。
         allow = allowed_home_ids(self._kv_repo)

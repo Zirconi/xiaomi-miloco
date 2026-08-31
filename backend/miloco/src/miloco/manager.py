@@ -5,6 +5,7 @@
 Service manager module
 """
 
+import asyncio
 import logging
 import uuid
 
@@ -14,6 +15,7 @@ from miloco.database.person_repo import PersonRepo
 from miloco.home_profile.service import HomeProfileService
 from miloco.miot.client import MiotProxy
 from miloco.miot.service import MiotService
+from miloco.miot.state_align import align_iot_state
 from miloco.node_monitor import NodeKind, NodeName, get_monitor
 from miloco.perception import init_perception_module
 from miloco.perception.service import PerceptionService
@@ -38,10 +40,66 @@ class Manager:
         if cls._instance is None:
             cls._instance = super().__new__(cls)
             cls._instance._initialized = False
+            # 作用域代号：切换账号或家庭时 +1。对齐、属性推送、删除调和写容器之前都
+            # 比一次，比不上就整段放弃 —— 挡掉旧作用域迟到的写入。
+            # 只有切换编排递增它，且那段在一把锁里跑，没有第二个写者。
+            cls._instance._scope = 0
+            # 已对齐到哪一代。存代号不存布尔：代号一推进旧标记自动失效，
+            # 没有「谁负责重置」这个问题。初值取一个不可能等于真实代号的数
+            cls._instance._aligned_scope = -1
+            # 启动对齐的 task。挂在这里而不是 lifespan 的局部变量里，
+            # 切换编排才够得着去取消上一轮
+            cls._instance.state_align_task = None
+            # 容器在这里建、在 initialize() 里 start：切换编排够得着它的时候
+            # initialize() 不一定跑完，而没建起来的话编排会在清空那一步炸掉
+            cls._instance._state_store = StateStore()
         return cls._instance
 
     def __init__(self):
         pass
+
+    def current_scope(self) -> int:
+        return self._scope
+
+    def begin_scope_switch(self) -> int:
+        """代号 +1 并返回新值。唯一的递增入口。"""
+        self._scope += 1
+        return self._scope
+
+    def mark_scope_aligned(self, scope: int) -> None:
+        """标记这一代已完成对齐。不是当前代就忽略 —— 那是迟到的旧对齐。"""
+        if scope == self._scope:
+            self._aligned_scope = scope
+
+    def scope_is_aligned(self) -> bool:
+        return self._aligned_scope == self._scope
+
+    def start_state_alignment(self) -> asyncio.Task | None:
+        """起一轮状态对齐，跑完把这一代标成已对齐。
+
+        句柄留在 state_align_task 上：下一次作用域切换必须先取消它，否则它会把旧
+        作用域的值写进刚清空重建的树。
+
+        初始化还没跑完时只记一条日志、不起对齐 —— 这一代因此停在「未对齐」，依赖它的
+        属性订阅门是关着的，正是安全的那一侧。
+        """
+        if not self._initialized:
+            logger.warning("初始化还没跑完，这一代不做状态对齐")
+            return None
+        scope = self._scope
+        proxy = self._miot_proxy
+
+        async def run() -> None:
+            if await align_iot_state(
+                self._state_store,
+                proxy,
+                scope=scope,
+                current_scope=self.current_scope,
+            ):
+                self.mark_scope_aligned(scope)
+
+        self.state_align_task = asyncio.create_task(run())
+        return self.state_align_task
 
     async def initialize(self):
         """
@@ -106,10 +164,8 @@ class Manager:
 
         self._task_service = TaskService(rule_service=self._rule_service)
 
-        # 状态容器：这里只做启动对齐一次，还没有消费方订阅它。
-        # 对齐 task 由 lifespan 建并负责取消 —— 它要打若干次云端请求，不能挡住启动，
-        # 而关闭时必须有人取消它，否则容器停了它还在往里写。
-        self._state_store = StateStore()
+        # 容器本身在 __new__ 里就建好了，这里只是接上 event loop 开始投递。
+        # 对齐由 start_state_alignment 起，关闭时 lifespan 取消，切换时编排取消
         self._state_store.start()
 
         self._initialized = True
